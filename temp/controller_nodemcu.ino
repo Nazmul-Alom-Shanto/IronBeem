@@ -1,47 +1,50 @@
 /*
  * AI-Powered Laser Turret - Component 3: The "Hands"
- * MCU: ESP32
+ * MCU: NodeMCU 1.0 (ESP8266)
  * Role: This script is the "robot body." It obeys commands
  * from the "Brain" (Laptop) to move servos and fire the laser.
  *
- * --- VERSION: Fixed attach() function and removed stray text ---
+ * --- VERSION: Added /testpan and /testtilt routes for debugging ---
 */
 
-// -- CHANGED -- (Libraries for ESP32)
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ESP32Servo.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Servo.h>
 
 // --- 1. WIFI CREDENTIALS ---
-const char* ssid = "shanto";
-const char* password = "shanto.py";
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// !!! ENTER YOUR WIFI SSID AND PASSWORD  !!!
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+const char* ssid = "403";
+const char* password = "vewjp98479";
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
-// --- 2. HARDWARE PINS (!!! YOU MUST CHANGE THESE !!!) ---
-// (The names D1, D2, etc. do not exist on ESP32)
-// (Look at your board and pick new GPIO numbers)
-// -- CHANGED --
-const int PAN_SERVO_PIN = 25;  // Example: GPIO 25
-const int TILT_SERVO_PIN = 26; // Example: GPIO 26
-const int LASER_PIN = 27;      // Example: GPIO 27
-const int TEST_PIN = 14;       // Example: GPIO 14
-// --- LINE 24 "Wake up with purpose" REMOVED ---
-
+// --- 2. HARDWARE PINS ---
+// (You can change these)
+const int PAN_SERVO_PIN = D1;  // Servo for X-axis (left/right)
+const int TILT_SERVO_PIN = D2; // Servo for Y-axis (up/down)
+const int LASER_PIN = D5;      // Signal pin for the laser module
+const int TEST_PIN = D3;       // User's test pin
 
 // --- 3. TUNING PARAMETERS (IMPORTANT!) ---
-const float KP_PAN = 0.07;
-const float KP_TILT = -0.07;
+// These "P-Gains" control *how fast* the servo reacts to the error.
+// - Start with SMALL values (like 0.05).
+// - If the turret is too slow, increase it slightly (e.g., 0.08).
+// - If the turret overshoots and "wobbles," decrease it.
+const float KP_PAN = 1; // Proportional gain for Pan (X-axis)
+
+// ** Y-Axis might be inverted! **
+// If the turret moves UP when the hand is DOWN, make this negative.
+const float KP_TILT = 1; // Proportional gain for Tilt (Y-axis)
 
 // --- 4. SERVO LIMITS ---
-const int MIN_ANGLE = 10;
-const int MAX_ANGLE = 5000;
-const int HOME_ANGLE = 90;
+const int MIN_ANGLE = 20;  // Minimum angle for servos (to prevent hitting frame)
+const int MAX_ANGLE = 160; // Maximum angle for servos
+const int HOME_ANGLE = 90; // Center position
 
 // --- 5. GLOBAL OBJECTS ---
-// -- CHANGED -- (Class name is now WebServer)
-WebServer server(80);
-
-// -- CHANGED -- (Uses the ESP32Servo library now)
+ESP8266WebServer server(80); // Standard HTTP port
 Servo servoPan;
 Servo servoTilt;
 
@@ -56,25 +59,22 @@ void handleTestTilt();
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n--- ESP32 'Hands' Initializing (DEBUG_V3) ---"); // -- CHANGED --
+  Serial.println("\n\n--- NodeMCU 'Hands' Initializing (DEBUG_V2) ---");
 
   // --- 1. Setup Hardware ---
   Serial.println("[DEBUG] Setting up hardware pins...");
   pinMode(LASER_PIN, OUTPUT);
   digitalWrite(LASER_PIN, LOW); // Start with laser OFF
-  Serial.printf("[DEBUG]   > LASER_PIN (GPIO %d) set to OUTPUT, LOW\n", LASER_PIN);
+  Serial.println("[DEBUG]   > LASER_PIN (D5) set to OUTPUT, LOW");
 
   pinMode(TEST_PIN, OUTPUT);
   digitalWrite(TEST_PIN, LOW); // Start with test pin OFF
-  Serial.printf("[DEBUG]   > TEST_PIN (GPIO %d) set to OUTPUT, LOW\n", TEST_PIN);
+  Serial.println("[DEBUG]   > TEST_PIN (D3) set to OUTPUT, LOW");
 
-  // --- Setup Servos for ESP32 ---
-  // -- CHANGED -- (Using the correct 1-argument attach function)
-  // The library will automatically assign the next free PWM channel.
+
   servoPan.attach(PAN_SERVO_PIN);
   servoTilt.attach(TILT_SERVO_PIN);
-  Serial.printf("[DEBUG]   > Servos attached to pins GPIO %d, GPIO %d\n", PAN_SERVO_PIN, TILT_SERVO_PIN);
-
+  Serial.println("[DEBUG]   > Servos attached to pins D1, D2");
 
   // Go to home position
   Serial.print("[DEBUG] Moving servos to home position (");
@@ -98,17 +98,21 @@ void setup() {
 
   // --- 3. Setup Web Server Endpoints ---
   Serial.println("[DEBUG] Registering web server endpoints...");
+  // Endpoint 1: /aim
   server.on("/aim", handleAim);
   Serial.println("[DEBUG]   > /aim registered");
 
+  // Endpoint 2: /laser
   server.on("/laser", handleLaser);
   Serial.println("[DEBUG]   > /laser registered");
 
+  // --- NEW: Register Test Endpoints ---
   server.on("/testpan", handleTestPan);
   Serial.println("[DEBUG]   > /testpan registered");
 
   server.on("/testtilt", handleTestTilt);
   Serial.println("[DEBUG]   > /testtilt registered");
+  // ---
 
   // --- 4. Start Server ---
   server.begin();
@@ -119,24 +123,29 @@ void setup() {
 }
 
 void loop() {
+  // This is the only thing needed in the loop.
+  // It listens for incoming HTTP requests.
   server.handleClient();
 }
 
-// --- ALL LOGIC BELOW THIS LINE IS IDENTICAL ---
-// --- NO CHANGES WERE NEEDED TO THE HANDLERS ---
-
 /**
  * @brief Handles the /aim command
+ * This is the P-Controller (Proportional Controller).
+ * It calculates a *correction* based on the error received.
  */
 void handleAim() {
   Serial.println("\n[DEBUG] === Endpoint /aim hit ===");
 
+  // Check if we have the required arguments
   if (!server.hasArg("x") || !server.hasArg("y")) {
     Serial.println("[ERROR] Bad Request: Missing x or y");
     server.send(400, "text/plain", "Bad Request: Missing x or y");
     return;
   }
 
+  // Get the error values from the URL
+  // error_x > 0 means target is to the RIGHT
+  // error_y > 0 means target is BELOW center
   float error_x = server.arg("x").toFloat();
   float error_y = server.arg("y").toFloat();
   Serial.print("[DEBUG]   Raw Error (x, y): (");
@@ -145,6 +154,9 @@ void handleAim() {
   Serial.print(error_y);
   Serial.println(")");
 
+  // --- P-Controller Logic ---
+  // Calculate the *change* in angle needed
+  // This is the "Proportional" part
   float panCorrection = error_x * KP_PAN;
   float tiltCorrection = error_y * KP_TILT;
   Serial.print("[DEBUG]   Correction (pan, tilt): (");
@@ -153,6 +165,8 @@ void handleAim() {
   Serial.print(tiltCorrection);
   Serial.println(")");
 
+  // Update the current angle
+  // We use += so the movement is relative
   currentPanAngle += panCorrection;
   currentTiltAngle += tiltCorrection;
   Serial.print("[DEBUG]   New Unconstrained Angle (pan, tilt): (");
@@ -161,6 +175,8 @@ void handleAim() {
   Serial.print(currentTiltAngle);
   Serial.println(")");
 
+  // --- Constrain & Write ---
+  // Clamp the values to stay within our safe limits
   currentPanAngle = constrain(currentPanAngle, MIN_ANGLE, MAX_ANGLE);
   currentTiltAngle = constrain(currentTiltAngle, MIN_ANGLE, MAX_ANGLE);
   Serial.print("[DEBUG]   FINAL Constrained Angle (pan, tilt): (");
@@ -169,9 +185,11 @@ void handleAim() {
   Serial.print((int)currentTiltAngle);
   Serial.println(")");
 
+  // Send the final angle to the servos
   servoPan.write((int)currentPanAngle);
   servoTilt.write((int)currentTiltAngle);
 
+  // Send a simple "OK" response
   server.send(200, "text/plain", "OK");
   Serial.println("[DEBUG]   > Sent 200/OK response.");
 }
@@ -201,8 +219,12 @@ void handleLaser() {
   }
 }
 
+// --- NEW TEST FUNCTIONS ---
+
 /**
  * @brief Handles the /testpan command
+ * Adds a value to the current pan angle.
+ * Listens for: /testpan?angle=10
  */
 void handleTestPan() {
   Serial.println("\n[DEBUG] === Endpoint /testpan hit ===");
@@ -231,6 +253,8 @@ void handleTestPan() {
 
 /**
  * @brief Handles the /testtilt command
+ * Adds a value to the current tilt angle.
+ * Listens for: /testtilt?angle=-5
  */
 void handleTestTilt() {
   Serial.println("\n[DEBUG] === Endpoint /testtilt hit ===");

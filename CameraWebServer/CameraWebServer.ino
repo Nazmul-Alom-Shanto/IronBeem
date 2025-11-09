@@ -9,8 +9,8 @@
 // ===========================
 // Enter your WiFi credentials
 // ===========================
-const char *ssid = "403";
-const char *password = "vewjp98479";
+const char *ssid = "shanto";
+const char *password = "shanto.py";
 
 void startCameraServer();
 void setupLedFlash();
