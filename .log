@@ -1,0 +1,11 @@
+ESP32 CAM(EYE)
+--- 192.168.43.86 ping statistics ---
+603 packets transmitted, 592 received, 1.82421% packet loss, time 603111ms
+rtt min/avg/max/mdev = 20.546/174.321/569.157/95.816 ms
+
+
+ESP32 (ARM)
+--- 192.168.43.212 ping statistics ---
+625 packets transmitted, 577 received, 7.68% packet loss, time 625987ms
+rtt min/avg/max/mdev = 16.386/177.046/404.099/98.876 ms
+

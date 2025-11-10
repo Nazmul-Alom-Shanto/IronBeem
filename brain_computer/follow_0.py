@@ -1,14 +1,13 @@
 import cv2
-# import cv2.aruco as aruco  <- No longer needed
+import cv2.aruco as aruco
 import requests
 import time
 import numpy as np
-import threading
-import mediapipe as mp  # ««« ADDED: Import MediaPipe
+import threading  # ««« ADDED: Import the threading library
 
 # --- 1. CONSTANTS (USER MUST EDIT THESE) ---
-EYE_STREAM_URL = "http://192.168.43.86/stream"
-HANDS_URL = "http://192.168.43.212"
+EYE_STREAM_URL = "http://192.168.43.86/stream"  # ESP32-CAM MJPEG stream URL
+HANDS_URL = "http://192.168.43.212"               # ESP32 "Hands" IP
 
 # --- 2. TUNING PARAMETERS ---
 FIRE_THRESHOLD_PX = 45
@@ -20,18 +19,11 @@ on_target_since = None
 center_x = 640 // 2
 center_y = 480 // 2
 
-# --- 4. MediaPipe Hand Setup ---
-print("Initializing MediaPipe Hands...")
-mp_hands = mp.solutions.hands
-# Initialize with 1 hand, 70% detection confidence
-hands = mp_hands.Hands(
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
-# not 12 , it have be 10
-TARGET_LANDMARK = mp_hands.HandLandmark.MIDDLE_FINGER_TIP  # Target Landmark #12
-print("MediaPipe Hands initialized.")
+# --- 4. ArUco Setup ---
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+detector = aruco.ArucoDetector(aruco_dict, parameters)
+TARGET_ID = 0  # Only track marker ID 0
 
 # --- 5. Helper function ---
 def send_command(url):
@@ -42,7 +34,7 @@ def send_command(url):
     try:
         requests.get(url, timeout=0.5)
     except requests.exceptions.RequestException:
-        pass  # Silently fail
+        pass  # ««« CHANGED: Silently fail to avoid console spam
 
 # --- 6. Initialize Stream ---
 cap = cv2.VideoCapture(EYE_STREAM_URL)
@@ -64,49 +56,41 @@ while True:
     h, w, _ = frame.shape
     center_x, center_y = w // 2, h // 2
 
-    # ««« --- MEDIAPIPE PROCESSING --- »»»
-    # 1. Convert BGR image to RGB for MediaPipe
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # 2. Process the image to find hands
-    results = hands.process(frame_rgb)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(gray)
 
     target_found = False
     error_x = 0
     error_y = 0
 
-    # 3. Check if any hand landmarks were found
-    if results.multi_hand_landmarks:
-        # Get the first (and only) hand
-        hand_landmarks = results.multi_hand_landmarks[0]
-        
-        # 4. Get the target landmark (Middle Finger Tip)
-        target_point = hand_landmarks.landmark[TARGET_LANDMARK]
-        
-        # 5. Convert normalized (0.0-1.0) coordinates to pixel coordinates
-        target_x = int(target_point.x * w)
-        target_y = int(target_point.y * h)
-        
-        target_found = True
-        error_x = target_x - center_x
-        error_y = target_y - center_y
+    if ids is not None:
+        for i, corner in zip(ids.flatten(), corners):
+            if i == TARGET_ID:
+                target_found = True
+                c = corner[0].astype(int)
+                # Center of marker
+                target_x, target_y = int(np.mean(c[:, 0])), int(np.mean(c[:, 1]))
+                error_x = target_x - center_x
+                error_y = target_y - center_y
 
-        # --- Draw results ---
-        # Draw the full hand skeleton
-        mp_drawing.draw_landmarks(
-            frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        
-        # Draw the red target circle on the fingertip
-        cv2.circle(frame, (target_x, target_y), 10, (0, 0, 255), -1)
-        
-    # ««« --- END OF MEDIAPIPE BLOCK --- »»»
+                # Draw marker
+                aruco.drawDetectedMarkers(frame, [corner], np.array([[i]]))
+                # Draw target center
+                cv2.circle(frame, (target_x, target_y), 10, (0, 0, 255), -1)
+                
+                # ««« REMOVED: Print statement here to reduce spam.
+                # You can add it back if you need to debug.
+                # print(f"Error (x, y): {error_x}, {error_y}") 
+                break
 
-    # Send aiming command (This logic is UNCHANGED)
+    # Send aiming command
     if target_found:
+        # ««« CHANGED: This now runs in a separate thread
+        # This is the "fire and forget" non-blocking call.
         url = f"{HANDS_URL}/aim?x={error_x}&y={error_y}"
         threading.Thread(target=send_command, args=(url,), daemon=True).start()
 
-    # Fire logic (This logic is UNCHANGED)
+    # Fire logic
     is_on_target = target_found and abs(error_x) < FIRE_THRESHOLD_PX and abs(error_y) < FIRE_THRESHOLD_PX
     new_laser_state = "off"
     if is_on_target:
@@ -118,13 +102,14 @@ while True:
         on_target_since = None
 
     if new_laser_state != laser_state:
+        # ««« CHANGED: This also runs in a separate thread
         url = f"{HANDS_URL}/laser?state={new_laser_state}"
         threading.Thread(target=send_command, args=(url,), daemon=True).start()
         
         laser_state = new_laser_state
         print(f"LASER: {laser_state.upper()}")
 
-    # Draw crosshairs (This logic is UNCHANGED)
+    # Draw crosshairs
     cv2.line(frame, (center_x, 0), (center_x, h), (0, 255, 0), 1)
     cv2.line(frame, (0, center_y), (w, center_y), (0, 255, 0), 1)
     cv2.rectangle(frame,
@@ -132,19 +117,17 @@ while True:
                   (center_x + FIRE_THRESHOLD_PX, center_y + FIRE_THRESHOLD_PX),
                   (0, 255, 255), 1)
 
-    cv2.imshow("Iron Beam Brain (Hand Tracker)", frame) # Changed window title
+    cv2.imshow("Iron Beam Brain", frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         print("Quitting...")
         break
 
-# --- Cleanup ---
 cap.release()
 cv2.destroyAllWindows()
-hands.close() # ««« ADDED: Clean up MediaPipe
 
 # Send final "laser off" command in a thread
 print("Turning laser off.")
 url = f"{HANDS_URL}/laser?state=off"
-threading.Thread(target=send_command, args=(url,), daemon=True).start()
-time.sleep(0.5)
+threading.Thread(target=send_command, args=(url,), daemon=True).start() # ««« CHANGED
+time.sleep(0.5) # ««« ADDED: Give the final command a moment to send

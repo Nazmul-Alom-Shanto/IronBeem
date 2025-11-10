@@ -29,8 +29,8 @@ const int TEST_PIN = 14;       // Example: GPIO 14
 
 
 // --- 3. TUNING PARAMETERS (IMPORTANT!) ---
-const float KP_PAN = 0.07;
-const float KP_TILT = -0.07;
+const float KP_PAN = 0.05;
+const float KP_TILT = 0.05;
 
 // --- 4. SERVO LIMITS ---
 const int MIN_ANGLE = 10;
