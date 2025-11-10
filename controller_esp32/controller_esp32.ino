@@ -1,22 +1,20 @@
 /*
  * AI-Powered Laser Turret - Component 3: The "Hands"
  * MCU: ESP32
- * Role: Receives aiming commands (error_x, error_y) and
+ * Role: Receives ABSOLUTE angles (pan, tilt) and
  * drives two servos + a laser diode.
  *
  * ===== CHANGELOG =====
- * - Fixed MAX_ANGLE from 360 to 170 (common servos are 0-180)
- * - Added Client IP to logs for more detail
- * - Added detailed performance logging (Time Since Last, RPS)
- * - Changed angle math to use round() instead of floor()
- * =======================
+ * - Refactored /aim to accept absolute pan/tilt angles.
+ * - Removed all gain/correction logic from ESP32.
+ * - All P-control logic is now on the Python 'Brain'.
+ * - Kept safety clamping.
  */
-
 // ========== LIBRARIES ==========
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESP32Servo.h>
-#include <math.h> // ««« ADDED: For round()
+#include <math.h> 
 
 // ========== WIFI SETTINGS ==========
 const char* ssid     = "shanto";
@@ -31,23 +29,21 @@ const int LASER_PIN       = 27;
 Servo panServo;
 Servo tiltServo;
 
-// Initial angles
+// Initial angles (tracks current state)
 int panAngle  = 90;
-int tiltAngle = 60;
+int tiltAngle = 90;
 
-// Limits
+// Limits (Safety clamp)
 const int MIN_ANGLE = 10;
 const int MAX_ANGLE = 170; // Safe limit for 180-deg servos
 
-// Tuning (direction depends on your turret orientation)
-float PAN_GAIN  = 0.0225;
-float TILT_GAIN = -0.0225; // Negative gain flips the direction
+// ❌ REMOVED: GAIN constants are now in Python
 
 // Web server
 WebServer server(80);
 
 // ========== PERFORMANCE LOGGING ==========
-unsigned long lastRequestTime = 0; // ««« ADDED: For RPS calculation
+unsigned long lastRequestTime = 0; 
 
 // ========== COLOR LOGS ==========
 #define RED     "\033[31m"
@@ -55,9 +51,8 @@ unsigned long lastRequestTime = 0; // ««« ADDED: For RPS calculation
 #define YELLOW  "\033[33m"
 #define BLUE    "\033[34m"
 #define CYAN    "\033[36m"
-#define MAGENTA "\033[35m" // ««« ADDED: For new logs
+#define MAGENTA "\033[35m" 
 #define RESET   "\033[0m"
-
 
 // ===================== CLAMP ANGLES =====================
 int clampAngle(int value) {
@@ -68,89 +63,68 @@ int clampAngle(int value) {
 }
 
 
-// ===================== AIM HANDLER =====================
+// ===================== AIM HANDLER (✅ MODIFIED) =====================
 void handleAim() {
   // --- 1. Performance Timing ---
-  unsigned long startTime = micros(); // For processing time
-  float timeSinceLastMs = (startTime - lastRequestTime) / 1000.0; // ««« ADDED
-  float rps = 1000.0 / timeSinceLastMs; // ««« ADDED
-  lastRequestTime = startTime; // ««« ADDED: Reset timer
+  unsigned long startTime = micros(); 
+  float timeSinceLastMs = (startTime - lastRequestTime) / 1000.0; 
+  float rps = 1000.0 / timeSinceLastMs; 
+  lastRequestTime = startTime; 
 
   // --- 2. Request Logging ---
   String clientIP = server.client().remoteIP().toString();
   Serial.printf(CYAN "\n=== /aim REQUEST from %s ===\n" RESET, clientIP.c_str());
-  
-  // --- ««« ADDED: Log timing stats ---
   Serial.printf(MAGENTA " > Perf: %.2f ms since last (%.1f RPS)\n" RESET, timeSinceLastMs, rps);
-
-  if (!server.hasArg("x") || !server.hasArg("y")) {
-    Serial.println(RED "[ERROR] Missing x or y parameters!" RESET);
-    server.send(400, "text/plain", "Missing x or y parameter");
+  
+  // --- 3. Get Absolute Angle Inputs ---
+  if (!server.hasArg("pan") || !server.hasArg("tilt")) {
+    Serial.println(RED "[ERROR] Missing pan or tilt parameters!" RESET);
+    server.send(400, "text/plain", "Missing pan or tilt parameter");
     return;
   }
+  
+  int newPan  = server.arg("pan").toInt();
+  int newTilt = server.arg("tilt").toInt();
+  Serial.printf(YELLOW " > Input Angles: PAN=%d, TILT=%d\n" RESET, newPan, newTilt);
 
-  // --- 3. Get Error Inputs ---
-  int errorX = server.arg("x").toInt();
-  int errorY = server.arg("y").toInt();
-  Serial.printf(YELLOW " > Input Errors: X=%d, Y=%d\n" RESET, errorX, errorY);
+  // ❌ REMOVED: All correction, gain, and float math is gone.
 
-  // Store old angles for more meaningful logs
+  // --- 4. Store old angles (for logging) & Apply Safety Clamp ---
   int oldPan  = panAngle;
   int oldTilt = tiltAngle;
-
-  // --- 4. Proportional Control (Float Math) ---
-  float panCorrection  = errorX * PAN_GAIN;
-  float tiltCorrection = errorY * TILT_GAIN;
-
-  // Calculate new float angles BEFORE rounding
-  float floatPanAngle  = (float)panAngle  - panCorrection;
-  float floatTiltAngle = (float)tiltAngle - tiltCorrection;
   
-  // --- ««« ADDED: Log detailed float math ---
-  Serial.printf(BLUE " > Float Math: pan(%.2f - %.2f = %.2f) tilt(%.2f - %.2f = %.2f)\n" RESET,
-                (float)oldPan, panCorrection, floatPanAngle,
-                (float)oldTilt, tiltCorrection, floatTiltAngle);
+  // We trust Python, but clamp just in case for safety
+  panAngle  = clampAngle(newPan);
+  tiltAngle = clampAngle(newTilt);
 
-  // --- 5. Apply round() and Convert to Integer ---
-  // ««« MODIFIED: Use round() as requested ---
-  panAngle  = (int)round(floatPanAngle);
-  tiltAngle = (int)round(floatTiltAngle);
-
-  // --- 6. Clamp Angles ---
-  panAngle  = clampAngle(panAngle);
-  tiltAngle = clampAngle(tiltAngle);
-
-  // --- 7. Move Servos ---
+  // --- 5. Move Servos ---
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
 
-  // --- 8. Final Log ---
+  // --- 6. Final Log ---
   Serial.printf(GREEN " > Servo Output: PAN %d -> %d | TILT %d -> %d\n" RESET, 
                 oldPan, panAngle, oldTilt, tiltAngle);
-
+                
   server.send(200, "text/plain", "OK");
-
   unsigned long duration = micros() - startTime;
   Serial.printf(MAGENTA " > Request processing time: %lu us\n" RESET, duration);
 }
 
 
-
 // ===================== LASER HANDLER =====================
+// (This function is unchanged)
 void handleLaser() {
-  lastRequestTime = micros(); // ««« ADDED: Reset timer to keep RPS accurate
+  lastRequestTime = micros(); 
   String clientIP = server.client().remoteIP().toString();
-
   Serial.printf(CYAN "\n=== /laser REQUEST from %s ===\n" RESET, clientIP.c_str());
-
+  
   if (!server.hasArg("state")) {
     Serial.println(RED "[ERROR] Missing state parameter!" RESET);
     server.send(400, "text/plain", "Missing state parameter");
     return;
   }
-
+  
   String state = server.arg("state");
-
   if (state == "on") {
     digitalWrite(LASER_PIN, HIGH);
     Serial.println(GREEN " > Laser: ON" RESET);
@@ -159,17 +133,17 @@ void handleLaser() {
     digitalWrite(LASER_PIN, LOW);
     Serial.println(YELLOW " > Laser: OFF" RESET);
   }
-
+  
   server.send(200, "text/plain", "Laser set to " + state);
 }
 
 
-
 // ===================== SETUP =====================
+// (This function is unchanged)
 void setup() {
   Serial.begin(115200);
   Serial.println("\n\nBooting 'Hands' Controller...");
-
+  
   // Hardware setup
   pinMode(LASER_PIN, OUTPUT);
   digitalWrite(LASER_PIN, LOW);
@@ -179,19 +153,17 @@ void setup() {
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
-
   panServo.attach(PAN_SERVO_PIN);
   tiltServo.attach(TILT_SERVO_PIN);
-
+  
   // Center servos on boot
   panServo.write(panAngle);
   tiltServo.write(tiltAngle);
-  Serial.println(YELLOW "Servos centered at 90 deg." RESET);
+  Serial.println(YELLOW "Servos centered." RESET);
 
   // WiFi
   Serial.println(BLUE "\nConnecting to WiFi..." RESET);
   WiFi.begin(ssid, password);
-
   int retry = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -199,23 +171,21 @@ void setup() {
     retry++;
     if (retry % 16 == 0) Serial.println();
   }
-
+  
   Serial.println(GREEN "\n✅ WiFi Connected!" RESET);
   Serial.printf(GREEN "IP Address: %s\n" RESET, WiFi.localIP().toString().c_str());
-
+  
   // Web routes
   server.on("/aim", HTTP_GET, handleAim);
   server.on("/laser", HTTP_GET, handleLaser);
-
   server.begin();
   Serial.println(GREEN "✅ HTTP Server started! Waiting for commands..." RESET);
   
-  lastRequestTime = micros(); // ««« ADDED: Initialize the timer
+  lastRequestTime = micros();
 }
 
-
-
 // ===================== LOOP =====================
+// (This function is unchanged)
 void loop() {
   server.handleClient();
 }

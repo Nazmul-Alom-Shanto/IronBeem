@@ -9,11 +9,21 @@
 const char* ssid = "shanto";
 const char* password = "shanto.py";
 
+// ==== ✅ NEW: LED PWM Constants ====
+// The white flash LED is on GPIO 4
+const int LED_PIN = 4;
+// Use channel 1 for the LED (channel 0 is used by the camera)
+const int LEDC_CHANNEL = 1; 
+const int LEDC_RESOLUTION = 8; // 8-bit resolution (0-255)
+const int LEDC_FREQ = 5000;    // 5kHz PWM frequency
+
 // ==== Web Server ====
 WebServer server(80);
 
-// ==== Camera config ====
+// ==== Function Declarations ====
 void startCameraServer();
+void handle_jpeg_stream();
+void handle_led_control(); // ✅ NEW
 
 // ==== Setup ====
 void setup() {
@@ -41,21 +51,26 @@ void setup() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   
-  // *** SUGGESTION 1: Use 20MHz for more stability ***
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  
   config.frame_size = FRAMESIZE_VGA;    // 640x480
-  
-  // *** SUGGESTION 2: Corrected comment ***
-  config.jpeg_quality = 10;             // 0-63 (0=worst, 63=best)
-  config.fb_count = 2; // Use 2 for streaming, 1 if you run out of RAM
+  config.jpeg_quality = 10;
+  config.fb_count = 2;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
     return;
   }
+
+  // ==== ✅ NEW: LED PWM Setup ====
+  Serial.println("Setting up LED PWM...");
+  // Configure the PWM channel
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
+  // Attach the LED pin to the PWM channel
+  ledcAttachPin(LED_PIN, LEDC_CHANNEL);
+  // Turn the LED off on boot
+  ledcWrite(LEDC_CHANNEL, 0);
 
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
@@ -72,8 +87,32 @@ void setup() {
 
 // ==== Loop ====
 void loop() {
-  // *** FIX 1: Add server.handleClient() ***
   server.handleClient();
+}
+
+// ==== ✅ NEW: LED Control Handler ====
+void handle_led_control() {
+  int level = 0; // Default to 0 (off)
+  
+  // Check if the "level" parameter exists in the URL
+  if (server.hasArg("level")) {
+    level = server.arg("level").toInt();
+    
+    // Clamp the value to the valid 0-255 range
+    if (level < 0) level = 0;
+    if (level > 255) level = 255;
+    
+    Serial.printf("Setting LED brightness to: %d\n", level);
+    
+    // Write the brightness value to the PWM channel
+    ledcWrite(LEDC_CHANNEL, level);
+    
+    server.send(200, "text/plain", "OK, LED set to " + String(level));
+  } else {
+    // If "level" parameter is missing
+    Serial.println("Missing 'level' parameter");
+    server.send(400, "text/plain", "Missing 'level' parameter (e.g., /led?level=100)");
+  }
 }
 
 // ==== MJPEG streaming handler ====
@@ -83,7 +122,6 @@ void handle_jpeg_stream() {
   response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
   client.print(response);
 
-  // *** FIX 2: Add client.connected() check ***
   while (client.connected()) {
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
@@ -95,14 +133,15 @@ void handle_jpeg_stream() {
     client.write(fb->buf, fb->len);   
     client.print("\r\n");
     esp_camera_fb_return(fb);
-
-    // delay(83); // ~12 FPS
   }
-  
   Serial.println("Client disconnected from stream.");
 }
 
 void startCameraServer() {
   server.on("/stream", HTTP_GET, handle_jpeg_stream);
+  
+  // ==== ✅ NEW: Register the LED handler ====
+  server.on("/led", HTTP_GET, handle_led_control);
+  
   server.begin();
 }
