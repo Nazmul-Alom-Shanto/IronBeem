@@ -8,18 +8,18 @@ import statistics
 import math # ✅ ADDED for round()
 
 # --- 1. CONSTANTS ---
-EYE_STREAM_URL = "http://192.168.43.86/stream"
-HANDS_URL = "http://192.168.43.212"
+EYE_STREAM_URL = "http://10.42.0.176/stream"
+HANDS_URL = "http://10.42.0.164"
 
 # --- 2. TUNING PARAMETERS ---
-FIRE_THRESHOLD_PX = 55
+FIRE_THRESHOLD_PX = 45
 FIRE_TIME_SECONDS = 0.0
 
 # --- 3. STATE VARIABLES ---
 laser_state = "off"
 on_target_since = None
-center_x = 640 // 2
-center_y = 480 // 2
+center_x = 320 // 2
+center_y = 240 // 2
 
 # --- PERFORMANCE PROFILE ---
 frame_times = []
@@ -44,16 +44,14 @@ print("MediaPipe Hands initialized.")
 
 # --- 5. ✅ NEW: SERVO CONTROL STATE & GAINS ---
 # These values are moved from the ESP32
-PAN_GAIN  = 0.02
-TILT_GAIN = -0.02 # Negative gain flips the direction
+PAN_GAIN  = 0.04
+TILT_GAIN = -0.04 # Negative gain flips the direction
 
 # These must match the ESP32's initial state & limits
-MIN_ANGLE = 10
-MAX_ANGLE = 170
+MIN_ANGLE = 0
+MAX_ANGLE = 180
 current_pan_angle = 90.0  # Start at 90 (float for precision)
 current_tilt_angle = 60.0 # Start at 60 (float for precision)
-# reseting the servo position
-threading.Thread(target=send_command, args=("http://192.168.43.212/aim?tilt=90&pan=60",), daemon=True).start()
 
 def clamp_angle(value):
     """Clamps angle between MIN and MAX"""
@@ -96,6 +94,16 @@ if not cap.isOpened():
     print("❌ Could not open video stream.")
     exit()
 print("✅ Stream opened.")
+
+# reseting the servo position
+reset_url = f"{HANDS_URL}/aim?pan=90&tilt=60"
+threading.Thread(target=send_command, args=(reset_url,), daemon=True).start()
+print("✅ Sent initial servo reset command.")
+
+# ✅ ADD THESE LINES TO MAKE THE WINDOW RESIZABLE
+window_name = "Iron Beam Brain (Hand Tracker)"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(window_name, 960, 720) # 3x scaled (320*3=960, 240*3=720)
 
 # --- MAIN LOOP ---
 while True:

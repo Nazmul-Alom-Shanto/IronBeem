@@ -34,8 +34,8 @@ int panAngle  = 90;
 int tiltAngle = 90;
 
 // Limits (Safety clamp)
-const int MIN_ANGLE = 10;
-const int MAX_ANGLE = 170; // Safe limit for 180-deg servos
+const int MIN_ANGLE = -360;
+const int MAX_ANGLE = 360; // Safe limit for 180-deg servos
 
 // ❌ REMOVED: GAIN constants are now in Python
 

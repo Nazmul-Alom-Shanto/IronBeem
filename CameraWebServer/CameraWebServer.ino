@@ -1,9 +1,11 @@
+
 #define CAMERA_MODEL_AI_THINKER  // Most ESP32-CAM modules use AI-Thinker
 #include "camera_pins.h"
 #include "board_config.h"
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <driver/ledc.h>
 
 // ==== Wi-Fi settings ====
 const char* ssid = "shanto";
@@ -54,6 +56,7 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_VGA;    // 640x480
+  // config.frame_size = FRAMESIZE_QVGA;    // 320x240
   config.jpeg_quality = 10;
   config.fb_count = 2;
 
@@ -66,9 +69,8 @@ void setup() {
   // ==== ✅ NEW: LED PWM Setup ====
   Serial.println("Setting up LED PWM...");
   // Configure the PWM channel
-  ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
-  // Attach the LED pin to the PWM channel
-  ledcAttachPin(LED_PIN, LEDC_CHANNEL);
+ledcAttach(LED_PIN, LEDC_FREQ, LEDC_RESOLUTION);
+  
   // Turn the LED off on boot
   ledcWrite(LEDC_CHANNEL, 0);
 
