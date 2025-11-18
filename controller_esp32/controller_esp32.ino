@@ -1,191 +1,170 @@
 /*
- * AI-Powered Laser Turret - Component 3: The "Hands"
- * MCU: ESP32
- * Role: Receives ABSOLUTE angles (pan, tilt) and
- * drives two servos + a laser diode.
- *
- * ===== CHANGELOG =====
- * - Refactored /aim to accept absolute pan/tilt angles.
- * - Removed all gain/correction logic from ESP32.
- * - All P-control logic is now on the Python 'Brain'.
- * - Kept safety clamping.
- */
-// ========== LIBRARIES ==========
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ESP32Servo.h>
-#include <math.h> 
+   ESP32 "Hands" Controller - UNIFIED WebSocket Version (Improved)
+   
+   This version includes:
+   1. ✅ Hard-Stop Safety Limits for servos.
+   2. ✅ Anti-Jitter logic (only writes on change).
+   3. ✅ Fixed-size buffer for WebSocket to prevent crashes.
+*/
 
-// ========== WIFI SETTINGS ==========
-const char* ssid     = "shanto";
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <ESP32Servo.h>
+
+// --- WiFi Credentials ---
+const char* ssid = "shanto";
 const char* password = "shanto.py";
 
-// ========== HARDWARE PINS ==========
-const int PAN_SERVO_PIN  = 25;
-const int TILT_SERVO_PIN = 26;
-const int LASER_PIN       = 27;
+// --- ✅ Servo Safety Limits (HARD STOPS) ---
+// The controller will IGNORE any command outside these bounds.
+const int PAN_MIN = 5;
+const int PAN_MAX = 175;
+const int TILT_MIN = 20;
+const int TILT_MAX = 100;
 
-// ========== SERVOS ==========
+// --- ✅ Initial Positions (Must be within safe limits) ---
+const int PAN_START = 90;   // 90 is within 5-175
+const int TILT_START = 60;  // 60 is within 20-100
+
+// --- WebSocket Server ---
+WebSocketsServer webSocket = WebSocketsServer(81);
+// ✅ Set a max command length. Prevents buffer overflow crashes.
+// "175,100" is 7 chars. "laser_on" is 8. 32 is very safe.
+const int MAX_COMMAND_LENGTH = 32;
+
+// --- Servos ---
 Servo panServo;
 Servo tiltServo;
+int panPin = 26;
+int tiltPin = 27;
 
-// Initial angles (tracks current state)
-int panAngle  = 90;
-int tiltAngle = 90;
+// --- ✅ Servo State (for reducing jitter) ---
+// We store the last written value to avoid re-sending
+// the same command, which can cause servo buzz.
+// -1 forces the first write in setup().
+int currentPan = -1;
+int currentTilt = -1;
 
-// Limits (Safety clamp)
-const int MIN_ANGLE = -360;
-const int MAX_ANGLE = 360; // Safe limit for 180-deg servos
+// --- Laser ---
+int laserPin = 14;
 
-// ❌ REMOVED: GAIN constants are now in Python
+// ✅ UNIFIED WebSocket Event Handler (Improved)
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
 
-// Web server
-WebServer server(80);
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
 
-// ========== PERFORMANCE LOGGING ==========
-unsigned long lastRequestTime = 0; 
+    case WStype_CONNECTED: {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
+      }
+      break;
 
-// ========== COLOR LOGS ==========
-#define RED     "\033[31m"
-#define GREEN   "\033[32m"
-#define YELLOW  "\033[33m"
-#define BLUE    "\033[34m"
-#define CYAN    "\033[36m"
-#define MAGENTA "\033[35m" 
-#define RESET   "\033[0m"
+    case WStype_TEXT: {
+        // --- ✅ Robust, High-Speed Command Parser ---
 
-// ===================== CLAMP ANGLES =====================
-int clampAngle(int value) {
-  // Uses our new MIN/MAX ANGLE constants
-  if (value < MIN_ANGLE) return MIN_ANGLE;
-  if (value > MAX_ANGLE) return MAX_ANGLE;
-  return value;
+        // 1. Check for command length to prevent crash
+        if (length == 0 || length > MAX_COMMAND_LENGTH) {
+          Serial.println("Empty or invalid command, ignoring.");
+          return;
+        }
+
+        // 2. Create a null-terminated C-string from the payload
+        char msg[MAX_COMMAND_LENGTH + 1];
+        strncpy(msg, (const char *)payload, length);
+        msg[length] = '\0';
+  
+        // 3. Check for an "aim" command (which contains a comma)
+        char* comma = strchr(msg, ',');
+        
+        if (comma != NULL) {
+          // --- AIM COMMAND ---
+          // It's an aim command like "92,60"
+          
+          *comma = '\0'; // Split the string by replacing ',' with null
+          int panVal = atoi(msg);
+          int tiltVal = atoi(comma + 1);
+  
+          // 4. ✅ Apply safety limits (Hard Stops)
+          // We use max/min to "clamp" the value into the safe range.
+          int safePan = max(PAN_MIN, min(PAN_MAX, panVal));
+          int safeTilt = max(TILT_MIN, min(TILT_MAX, tiltVal));
+
+          // 5. ✅ Write to servos (Anti-Jitter Logic)
+          // Only send the command if the position has changed.
+          if (safePan != currentPan) {
+            panServo.write(safePan);
+            currentPan = safePan; // Store new position
+          }
+          if (safeTilt != currentTilt) {
+            tiltServo.write(safeTilt);
+            currentTilt = safeTilt; // Store new position
+          }
+          
+        } else {
+          // --- LASER COMMAND ---
+          // No comma, check for laser commands
+          
+          if (strcmp(msg, "laser_on") == 0) {
+            Serial.println("Laser ON");
+            digitalWrite(laserPin, HIGH);
+          } 
+          else if (strcmp(msg, "laser_off") == 0) {
+            Serial.println("Laser OFF");
+            digitalWrite(laserPin, LOW);
+          }
+          else {
+            Serial.printf("Unknown command: %s\n", msg);
+          }
+        }
+      }
+      break;
+  }
 }
 
-
-// ===================== AIM HANDLER (✅ MODIFIED) =====================
-void handleAim() {
-  // --- 1. Performance Timing ---
-  unsigned long startTime = micros(); 
-  float timeSinceLastMs = (startTime - lastRequestTime) / 1000.0; 
-  float rps = 1000.0 / timeSinceLastMs; 
-  lastRequestTime = startTime; 
-
-  // --- 2. Request Logging ---
-  String clientIP = server.client().remoteIP().toString();
-  Serial.printf(CYAN "\n=== /aim REQUEST from %s ===\n" RESET, clientIP.c_str());
-  Serial.printf(MAGENTA " > Perf: %.2f ms since last (%.1f RPS)\n" RESET, timeSinceLastMs, rps);
-  
-  // --- 3. Get Absolute Angle Inputs ---
-  if (!server.hasArg("pan") || !server.hasArg("tilt")) {
-    Serial.println(RED "[ERROR] Missing pan or tilt parameters!" RESET);
-    server.send(400, "text/plain", "Missing pan or tilt parameter");
-    return;
-  }
-  
-  int newPan  = server.arg("pan").toInt();
-  int newTilt = server.arg("tilt").toInt();
-  Serial.printf(YELLOW " > Input Angles: PAN=%d, TILT=%d\n" RESET, newPan, newTilt);
-
-  // ❌ REMOVED: All correction, gain, and float math is gone.
-
-  // --- 4. Store old angles (for logging) & Apply Safety Clamp ---
-  int oldPan  = panAngle;
-  int oldTilt = tiltAngle;
-  
-  // We trust Python, but clamp just in case for safety
-  panAngle  = clampAngle(newPan);
-  tiltAngle = clampAngle(newTilt);
-
-  // --- 5. Move Servos ---
-  panServo.write(panAngle);
-  tiltServo.write(tiltAngle);
-
-  // --- 6. Final Log ---
-  Serial.printf(GREEN " > Servo Output: PAN %d -> %d | TILT %d -> %d\n" RESET, 
-                oldPan, panAngle, oldTilt, tiltAngle);
-                
-  server.send(200, "text/plain", "OK");
-  unsigned long duration = micros() - startTime;
-  Serial.printf(MAGENTA " > Request processing time: %lu us\n" RESET, duration);
-}
-
-
-// ===================== LASER HANDLER =====================
-// (This function is unchanged)
-void handleLaser() {
-  lastRequestTime = micros(); 
-  String clientIP = server.client().remoteIP().toString();
-  Serial.printf(CYAN "\n=== /laser REQUEST from %s ===\n" RESET, clientIP.c_str());
-  
-  if (!server.hasArg("state")) {
-    Serial.println(RED "[ERROR] Missing state parameter!" RESET);
-    server.send(400, "text/plain", "Missing state parameter");
-    return;
-  }
-  
-  String state = server.arg("state");
-  if (state == "on") {
-    digitalWrite(LASER_PIN, HIGH);
-    Serial.println(GREEN " > Laser: ON" RESET);
-  } 
-  else {
-    digitalWrite(LASER_PIN, LOW);
-    Serial.println(YELLOW " > Laser: OFF" RESET);
-  }
-  
-  server.send(200, "text/plain", "Laser set to " + state);
-}
-
-
-// ===================== SETUP =====================
-// (This function is unchanged)
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\nBooting 'Hands' Controller...");
-  
-  // Hardware setup
-  pinMode(LASER_PIN, OUTPUT);
-  digitalWrite(LASER_PIN, LOW);
-  
-  // Allow allocation of all timers
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
-  panServo.attach(PAN_SERVO_PIN);
-  tiltServo.attach(TILT_SERVO_PIN);
-  
-  // Center servos on boot
-  panServo.write(panAngle);
-  tiltServo.write(tiltAngle);
-  Serial.println(YELLOW "Servos centered." RESET);
 
-  // WiFi
-  Serial.println(BLUE "\nConnecting to WiFi..." RESET);
+  // --- Init Servos ---
+  panServo.setPeriodHertz(50);
+  tiltServo.setPeriodHertz(50);
+  panServo.attach(panPin, 500, 2500);
+  tiltServo.attach(tiltPin, 500, 2500);
+
+  // --- Init Laser ---
+  pinMode(laserPin, OUTPUT);
+  digitalWrite(laserPin, LOW); // Ensure laser is off at boot
+ 
+  // --- Connect to WiFi ---
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
   WiFi.begin(ssid, password);
-  int retry = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    retry++;
-    if (retry % 16 == 0) Serial.println();
   }
-  
-  Serial.println(GREEN "\n✅ WiFi Connected!" RESET);
-  Serial.printf(GREEN "IP Address: %s\n" RESET, WiFi.localIP().toString().c_str());
-  
-  // Web routes
-  server.on("/aim", HTTP_GET, handleAim);
-  server.on("/laser", HTTP_GET, handleLaser);
-  server.begin();
-  Serial.println(GREEN "✅ HTTP Server started! Waiting for commands..." RESET);
-  
-  lastRequestTime = micros();
+  Serial.println("\nWiFi connected.");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP()); // <-- This is the IP you need
+
+  // --- Start WebSocket Server ---
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("Unified WebSocket server started on port 81.");
+
+  // --- Set initial position ---
+  panServo.write(PAN_START);
+  tiltServo.write(TILT_START);
+  currentPan = PAN_START;   // ✅ Store the initial state
+  currentTilt = TILT_START; // ✅ Store the initial state
+  Serial.println("Servos set to safe starting position.");
 }
 
-// ===================== LOOP =====================
-// (This function is unchanged)
 void loop() {
-  server.handleClient();
+  // ✅ Only one server to loop!
+  webSocket.loop();       // Handles all WebSocket traffic
+  
+  // No delay()! This loop runs as fast as possible.
 }

@@ -5,6 +5,8 @@ import mediapipe as mp
 import math
 import websocket # ✅ Using WebSockets for ALL commands 
 from collections import deque # ✅ More efficient way to track frame times
+import cv2.aruco as aruco
+
 
 # --- 1. CONSTANTS ---
 EYE_STREAM_URL = "http://10.42.0.176/stream"
@@ -53,6 +55,11 @@ TILT_MAX = 100
 current_pan_angle = 90.0  
 current_tilt_angle = 60.0 
 
+# --- 4. ArUco Setup ---
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+parameters = aruco.DetectorParameters()
+detector = aruco.ArucoDetector(aruco_dict, parameters)
+TARGET_ID = 0
 # ❌ Removed old generic clamp_angle function
 
 # --- 6. OVERLAY FUNCTION ---
@@ -122,22 +129,30 @@ while True:
 
     h, w, _ = frame.shape
     center_x, center_y = w//2   - 15 , h//2 + 25
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(frame_rgb)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    corners, ids, _ = detector.detectMarkers(gray)
+
     target_found = False
     error_x = 0
     error_y = 0
 
-    if results.multi_hand_landmarks:
-        hand_landmarks = results.multi_hand_landmarks[0]
-        target_point = hand_landmarks.landmark[TARGET_LANDMARK]
-        target_x = int(target_point.x * w)
-        target_y = int(target_point.y * h)
-        target_found = True
-        error_x = target_x - center_x
-        error_y = target_y - center_y
-        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        cv2.circle(frame, (target_x, target_y), 10, (0,0,255), -1)
+    # === ARUCO DETECTION ===
+    if ids is not None:
+        for i, corner in zip(ids.flatten(), corners):
+            if i == TARGET_ID:
+                target_found = True
+                c = corner[0].astype(int)
+
+                target_x = int(np.mean(c[:, 0]))
+                target_y = int(np.mean(c[:, 1]))
+
+                error_x = target_x - center_x
+                error_y = target_y - center_y
+
+                aruco.drawDetectedMarkers(frame, [corner], np.array([[i]]))
+                cv2.circle(frame, (target_x, target_y), 10, (0,0,255), -1)
+
+                break
 
     # === ✅ WEBSOCKET AIM COMMAND (ROBUST, NO SMOOTHING) ===
     if target_found:

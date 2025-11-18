@@ -11,17 +11,29 @@ rtt min/avg/max/mdev = 16.386/177.046/404.099/98.876 ms
 
 
 
-
+HAND
 --- 192.168.43.212 ping statistics ---
 1589 packets transmitted, 607 received, +232 errors, 61.7999% packet loss, time 1614259ms
 rtt min/avg/max/mdev = 3.825/545.643/20002.675/2017.977 ms, pipe 20
 
 
-
+EYE
 --- 192.168.43.86 ping statistics ---
 1642 packets transmitted, 1516 received, +3 errors, 7.67357% packet loss, time 1646906ms
 rtt min/avg/max/mdev = 3.672/302.316/9358.594/451.063 ms, pipe 10
 
+
+EYE
+--- 10.42.0.176 ping statistics ---
+212 packets transmitted, 212 received, 0% packet loss, time 211121ms
+rtt min/avg/max/mdev = 5.298/128.048/479.170/68.134 ms
+
+
+HAND
+--- 10.42.0.164 ping statistics ---
+151 packets transmitted, 151 received, 0% packet loss, time 150174ms
+rtt min/avg/max/mdev = 7.912/113.214/215.300/59.117 ms
+ 
 
 
 

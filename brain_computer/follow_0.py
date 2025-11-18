@@ -8,7 +8,7 @@ import statistics
 
 # --- 1. CONSTANTS ---
 EYE_STREAM_URL = "http://10.42.0.176/stream"
-HANDS_URL = "http://10.42.0.164"
+HANDS_URL = "http://10.42.0.164:81"
 
 # --- 2. TUNING PARAMETERS ---
 FIRE_THRESHOLD_PX = 45
@@ -55,15 +55,21 @@ detector = aruco.ArucoDetector(aruco_dict, parameters)
 TARGET_ID = 0
 
 
-# --- 5. Threaded sender ---
-def send_command(url):
-    global send_ok, send_fail, send_total
-    send_total += 1
+# --- 7. Helper: Safe WebSocket Send ---
+def ws_send(ws_conn, message):
     try:
-        requests.get(url, timeout=0.5)
-        send_ok += 1
-    except:
-        send_fail += 1
+        ws_conn.send(message)
+    except Exception as e:
+        print(f"WS send error: {e}. Reconnecting...")
+        try:
+            ws_conn.close()
+            ws_conn = websocket.create_connection(HANDS_WS_URL)
+            ws_conn.send(message) # Retry send
+            print("Reconnected.")
+        except Exception as e2:
+            print(f"Reconnect failed: {e2}")
+            time.sleep(1)
+    return ws_conn # Return new/old connection
 
 
 # --- 6. Initialize Stream ---
@@ -116,8 +122,24 @@ while True:
 
     # === SEND AIM COMMAND ===
     if target_found:
-        url = f"{HANDS_URL}/aim?x={error_x}&y={error_y}"
-        threading.Thread(target=send_command, args=(url,), daemon=True).start()
+         # 1. Calculate the new target angle
+        new_pan_angle  = current_pan_angle  - (error_x * PAN_GAIN)
+        new_tilt_angle = current_tilt_angle - (error_y * TILT_GAIN)
+        
+        # 2. ✅ CLAMP THE STATE to prevent "wind-up" bug
+        current_pan_angle = max(PAN_MIN, min(PAN_MAX, new_pan_angle))
+        current_tilt_angle = max(TILT_MIN, min(TILT_MAX, new_tilt_angle))
+        
+        # 3. Round for sending (no 2nd clamp needed)
+        pan_int  = int(round(current_pan_angle))
+        tilt_int = int(round(current_tilt_angle))
+        
+          # 4. Send command
+        # print("the new position is: (pan, tilt) = (", pan_int, "," , tilt_int, ")" )
+        ws = ws_send(ws, f"{pan_int},{tilt_int}")
+
+        # url = f"{HANDS_URL}/aim?x={error_x}&y={error_y}"
+        # threading.Thread(target=send_command, args=(url,), daemon=True).start()
 
     # === LASER FIRING LOGIC ===
     is_on_target = target_found and abs(error_x) < FIRE_THRESHOLD_PX and abs(error_y) < FIRE_THRESHOLD_PX
