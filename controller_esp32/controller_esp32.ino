@@ -96,10 +96,17 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           // Only send the command if the position has changed.
           if (safePan != currentPan) {
             panServo.write(safePan);
+            Serial.println("pan is at ");
+            Serial.println(safePan);
+            Serial.println("Right Now \n");
+
             currentPan = safePan; // Store new position
           }
           if (safeTilt != currentTilt) {
             tiltServo.write(safeTilt);
+            Serial.println("tilt is at ");
+            Serial.println(safeTilt);
+            Serial.println("Right Now \n");
             currentTilt = safeTilt; // Store new position
           }
           
