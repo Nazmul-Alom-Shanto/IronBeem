@@ -1,234 +1,281 @@
+#!/usr/bin/env python3
+"""
+IronBeem Brain - Modular Target Tracking System
+
+Usage:
+    python main.py --detector aruco
+    python main.py --detector mediapipe --no-display
+"""
+
 import cv2
 import time
-import numpy as np
-import mediapipe as mp 
-import math
-import websocket # ✅ Using WebSockets for ALL commands 
-from collections import deque # ✅ More efficient way to track frame times
+import argparse
+import sys
 
-# --- 1. CONSTANTS ---
-EYE_STREAM_URL = "http://10.42.0.176/stream"
-HANDS_WS_URL = "ws://10.42.0.164:81" 
+# Local imports
+from core import ServoController, LaserController, WebSocketManager, PerformanceTracker
+from detectors import create_detector, list_available_detectors
+import config
 
-# --- 2. TUNING PARAMETERS ---
-FIRE_THRESHOLD_PX = 40
-# ✅ WARNING: Setting this to 0.0 WILL cause the laser to
-# flicker rapidly. Recommend 0.1 or 0.2 for a stable "lock-on".
-FIRE_TIME_SECONDS = 0 # ✅ Changed from 0.0 to prevent flicker
-# ❌ Removed laser off delay
-# ❌ SMOOTH_FACTOR has been removed for direct control.
 
-# --- 3. STATE VARIABLES ---
-laser_state = "off"
-on_target_since = None
-# ❌ Removed target_lost_time
-center_x = 320 // 2
-center_y = 240 // 2
-
-# --- PERFORMANCE PROFILE ---
-# ✅ Use a deque for efficient profiling. It never grows past 200 items.
-frame_times = deque(maxlen=200)
-
-# --- 4. MediaPipe Setup ---
-print("Initializing MediaPipe Hands...")
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    max_num_hands=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.25
-)
-mp_drawing = mp.solutions.drawing_utils
-TARGET_LANDMARK = mp_hands.HandLandmark.MIDDLE_FINGER_MCP
-print("MediaPipe Hands initialized.")
-
-# --- 5. SERVO CONTROL STATE & GAINS ---
-PAN_GAIN  = 0.02  
-TILT_GAIN = -0.021
-# ✅ NEW: Hard-stop safety limits in Python
-PAN_MIN = 5
-PAN_MAX = 175
-TILT_MIN = 20
-TILT_MAX = 100
-# These are still needed to calculate the *next* position
-current_pan_angle = 90.0  
-current_tilt_angle = 60.0 
-
-# ❌ Removed old generic clamp_angle function
-
-# --- 6. OVERLAY FUNCTION ---
-def draw_stats_overlay(frame, fps, frame_time, min_t, avg_t, max_t):
+def draw_stats_overlay(frame, stats, servo_angles):
+    """Draw performance statistics overlay."""
     y = 22
     step = 22
-    cv2.putText(frame, f"FPS: {fps:.1f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+    
+    cv2.putText(frame, f"FPS: {stats['fps']:.1f}", (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += step
-    cv2.putText(frame, f"Frame: {frame_time:.1f} ms", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+    
+    cv2.putText(frame, f"Frame: {stats['frame_time']:.1f} ms", (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     y += step
-    cv2.putText(frame, f"Min/Avg/Max: {min_t:.1f}/{avg_t:.1f}/{max_t:.1f} ms", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,0), 2)
+    
+    cv2.putText(frame, 
+                f"Min/Avg/Max: {stats['min_time']:.1f}/{stats['avg_time']:.1f}/{stats['max_time']:.1f} ms",
+                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     y += step
-    cv2.putText(frame, f"Pan/Tilt: {current_pan_angle:.1f}/{current_tilt_angle:.1f}", (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2)
+    
+    pan, tilt = servo_angles
+    cv2.putText(frame, f"Pan/Tilt: {pan:.1f}/{tilt:.1f}", (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
-# --- 7. Helper: Safe WebSocket Send ---
-def ws_send(ws_conn, message):
-    try:
-        ws_conn.send(message)
-    except Exception as e:
-        print(f"WS send error: {e}. Reconnecting...")
-        try:
-            ws_conn.close()
-            ws_conn = websocket.create_connection(HANDS_WS_URL)
-            ws_conn.send(message) # Retry send
-            print("Reconnected.")
-        except Exception as e2:
-            print(f"Reconnect failed: {e2}")
-            time.sleep(1)
-    return ws_conn # Return new/old connection
 
-# --- 8. Initialize Stream & WebSocket ---
-cap = cv2.VideoCapture(EYE_STREAM_URL)
-if not cap.isOpened():
-    print("❌ Could not open video stream.")
-    exit()
-print("✅ Stream opened.")
-
-try:
-    print(f"Connecting to WebSocket at {HANDS_WS_URL}...")
-    ws = websocket.create_connection(HANDS_WS_URL)
-    print("✅ WebSocket connected.")
-except Exception as e:
-    print(f"❌ WebSocket connection failed: {e}")
-    exit()
-
-ws = ws_send(ws, "90,60")
-print("✅ Sent initial servo reset command via WebSocket.")
-
-window_name = "Iron Beam Brain (Fast Tracking)"
-cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(window_name, 960, 720) 
-
-# --- MAIN LOOP ---
-while True:
-    loop_start = time.time()
-    success, frame = cap.read()
-    if not success:
-        print("Dropped frame. Reconnecting...")
-        cap.release()
-        time.sleep(0.5)
-        cap = cv2.VideoCapture(EYE_STREAM_URL)
-        continue
-
+def draw_crosshair(frame, center_x, center_y, fire_threshold):
+    """Draw targeting crosshair and fire zone."""
     h, w, _ = frame.shape
-    center_x, center_y = w//2   - 15 , h//2 + 25
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(frame_rgb)
-    target_found = False
-    error_x = 0
-    error_y = 0
-
-    if results.multi_hand_landmarks:
-        hand_landmarks = results.multi_hand_landmarks[0]
-        target_point = hand_landmarks.landmark[TARGET_LANDMARK]
-        target_x = int(target_point.x * w)
-        target_y = int(target_point.y * h)
-        target_found = True
-        error_x = target_x - center_x
-        error_y = target_y - center_y
-        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-        cv2.circle(frame, (target_x, target_y), 10, (0,0,255), -1)
-
-    # === ✅ WEBSOCKET AIM COMMAND (ROBUST, NO SMOOTHING) ===
-    if target_found:
-        # 1. Calculate the new target angle
-        new_pan_angle  = current_pan_angle  - (error_x * PAN_GAIN)
-        new_tilt_angle = current_tilt_angle - (error_y * TILT_GAIN)
-        
-        # 2. ✅ CLAMP THE STATE to prevent "wind-up" bug
-        current_pan_angle = max(PAN_MIN, min(PAN_MAX, new_pan_angle))
-        current_tilt_angle = max(TILT_MIN, min(TILT_MAX, new_tilt_angle))
-        
-        # 3. Round for sending (no 2nd clamp needed)
-        pan_int  = int(round(current_pan_angle))
-        tilt_int = int(round(current_tilt_angle))
-        
-        # 4. Send command
-        # print("the new position is: (pan, tilt) = (", pan_int, "," , tilt_int, ")" )
-        ws = ws_send(ws, f"{pan_int},{tilt_int}")
-
-
-    # === ✅ SIMPLIFIED WEBSOCKET LASER LOGIC (NO DELAY) ===
-    is_on_target = target_found and abs(error_x) < FIRE_THRESHOLD_PX and abs(error_y) < FIRE_THRESHOLD_PX
-    now = time.time()
     
-    if is_on_target:
-        # --- Target is ACQUIRED ---
-        
-        # 1. Start the "ON" timer if this is the first frame on target
-        if on_target_since is None:
-            on_target_since = now
-        
-        # 2. Check if "ON" timer has expired
-        if (now - on_target_since) > FIRE_TIME_SECONDS:
-            # Timer has expired, we are cleared to fire.
-            if laser_state == "off":
-                # Only send command if not already on
-                ws = ws_send(ws, "laser_on")
-                print("LASER: ON")
-                laser_state = "on"
+    # Crosshair lines
+    cv2.line(frame, (center_x, 0), (center_x, h), (0, 255, 0), 1)
+    cv2.line(frame, (0, center_y), (w, center_y), (0, 255, 0), 1)
     
-    else:
-        # --- Target is LOST ---
-        
-        # 1. Reset the "ON" timer
-        on_target_since = None
-        
-        # 2. Turn laser off if it's on
-        if laser_state == "on":
-            ws = ws_send(ws, "laser_off")
-            print("LASER: OFF")
-            laser_state = "off"
-
-
-    # === DRAWING & PROFILING ===
-    cv2.line(frame, (center_x, 0), (center_x, h), (0,255,0), 1)
-    cv2.line(frame, (0, center_y), (w, center_y), (0,255,0), 1)
+    # Fire threshold box
     cv2.rectangle(frame,
-                  (center_x-FIRE_THRESHOLD_PX, center_y-FIRE_THRESHOLD_PX),
-                  (center_x+FIRE_THRESHOLD_PX, center_y+FIRE_THRESHOLD_PX),
-                  (0,255,255), 1)
+                  (center_x - fire_threshold, center_y - fire_threshold),
+                  (center_x + fire_threshold, center_y + fire_threshold),
+                  (0, 255, 255), 1)
 
-    frame_time = (time.time() - loop_start) * 1000
-    frame_times.append(frame_time) # Deque handles max length automatically
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="IronBeem Brain - Modular Target Tracking System"
+    )
     
-    if len(frame_times) >= 3:
-        recent = frame_times # No need to slice, deque is already capped
-        min_t = min(recent)
-        max_t = max(recent)
-        avg_t = sum(recent) / len(recent)
-        fps = 1000.0 / avg_t if avg_t > 0 else 0
-    else:
-        min_t = max_t = avg_t = frame_time
-        fps = 0
+    parser.add_argument(
+        "--detector",
+        type=str,
+        default="aruco",
+        choices=list_available_detectors(),
+        help=f"Detector type (choices: {', '.join(list_available_detectors())})"
+    )
     
-    draw_stats_overlay(frame, fps, frame_time, min_t, avg_t, max_t) 
-    cv2.imshow(window_name, frame)
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Disable GUI display (headless mode)"
+    )
+    
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Enable benchmark mode (print performance stats)"
+    )
+    
+    return parser.parse_args()
 
-    # === KEY INPUT ===
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        print("Quitting...")
-        break
 
-# --- CLEANUP ---
-print("Cleaning up resources...")
-print("Turning laser off.")
-ws = ws_send(ws, "laser_off")
+def main():
+    """Main orchestrator."""
+    # Parse arguments
+    args = parse_args()
+    
+    print("=" * 60)
+    print("IronBeem Brain - Modular Target Tracking System".center(60))
+    print("=" * 60)
+    print(f"Detector: {args.detector}")
+    print(f"Display: {'disabled' if args.no_display else 'enabled'}")
+    print("=" * 60)
+    
+    # === INITIALIZATION ===
+    
+    # Create detector
+    try:
+        print(f"\n[1/5] Initializing {args.detector} detector...")
+        if args.detector == "aruco":
+            detector = create_detector("aruco", target_id=config.ARUCO_TARGET_ID)
+            center_offset = config.CENTER_OFFSET_ARUCO
+        elif args.detector == "mediapipe":
+            detector = create_detector(
+                "mediapipe",
+                max_num_hands=config.MEDIAPIPE_MAX_HANDS,
+                min_detection_confidence=config.MEDIAPIPE_MIN_DETECTION_CONFIDENCE,
+                min_tracking_confidence=config.MEDIAPIPE_MIN_TRACKING_CONFIDENCE
+            )
+            center_offset = config.CENTER_OFFSET_MEDIAPIPE
+        print(f"✅ {detector.get_name()} initialized.")
+    except Exception as e:
+        print(f"❌ Failed to initialize detector: {e}")
+        sys.exit(1)
+    
+    # Create controllers
+    print("\n[2/5] Initializing controllers...")
+    servo = ServoController(
+        pan_gain=config.PAN_GAIN,
+        tilt_gain=config.TILT_GAIN,
+        pan_limits=(config.PAN_MIN, config.PAN_MAX),
+        tilt_limits=(config.TILT_MIN, config.TILT_MAX),
+        initial_pan=config.INITIAL_PAN,
+        initial_tilt=config.INITIAL_TILT
+    )
+    
+    laser = LaserController(
+        fire_threshold_px=config.FIRE_THRESHOLD_PX,
+        fire_delay_seconds=config.FIRE_TIME_SECONDS
+    )
+    
+    perf = PerformanceTracker(history_size=config.PERFORMANCE_HISTORY_SIZE)
+    print("✅ Controllers initialized.")
+    
+    # Connect to WebSocket
+    print("\n[3/5] Connecting to WebSocket...")
+    ws = WebSocketManager(config.HANDS_WS_URL)
+    if not ws.connect():
+        print("❌ Failed to connect to WebSocket.")
+        sys.exit(1)
+    
+    # Reset servos
+    print("[4/5] Resetting servo position...")
+    reset_pan, reset_tilt = servo.reset()
+    ws.send(f"{reset_pan},{reset_tilt}")
+    print(f"✅ Servos reset to ({reset_pan}, {reset_tilt}).")
+    
+    # Open video stream
+    print(f"\n[5/5] Opening video stream from {config.EYE_STREAM_URL}...")
+    cap = cv2.VideoCapture(config.EYE_STREAM_URL)
+    if not cap.isOpened():
+        print("❌ Could not open video stream.")
+        ws.close()
+        sys.exit(1)
+    print("✅ Video stream opened.")
+    
+    # Setup display window
+    if not args.no_display:
+        window_name = f"IronBeem - {detector.get_name()}"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
+    
+    print("\n" + "=" * 60)
+    print("SYSTEM READY - Press 'q' to quit".center(60))
+    print("=" * 60 + "\n")
+    
+    # === MAIN LOOP ===
+    try:
+        while True:
+            loop_start = time.time()
+            
+            # Capture frame
+            success, frame = cap.read()
+            if not success:
+                print("Dropped frame. Reconnecting...")
+                cap.release()
+                time.sleep(0.5)
+                cap = cv2.VideoCapture(config.EYE_STREAM_URL)
+                continue
+            
+            # Calculate frame center with offset
+            h, w, _ = frame.shape
+            center_x = w // 2 + center_offset[0]
+            center_y = h // 2 + center_offset[1]
+            
+            # === DETECTION ===
+            result = detector.detect(frame)
+            
+            # === CONTROL ===
+            if result:
+                # Calculate error
+                error_x, error_y = result.get_error(center_x, center_y)
+                
+                # Update servo position
+                pan_int, tilt_int = servo.calculate_movement(error_x, error_y)
+                
+                # ✅ Only send command if position actually changed
+                if servo.has_changed():
+                    ws.send(f"{pan_int},{tilt_int}")
+                    servo.update_last_sent()
+                
+                # Update laser state
+                laser_cmd = laser.update(True, error_x, error_y)
+                if laser_cmd:
+                    ws.send(laser_cmd)
+                    if args.benchmark:
+                        print(f"LASER: {laser_cmd}")
+            else:
+                # No target - turn off laser
+                laser_cmd = laser.update(False, 0, 0)
+                if laser_cmd:
+                    ws.send(laser_cmd)
+                    if args.benchmark:
+                        print(f"LASER: {laser_cmd}")
+            
+            # === DISPLAY ===
+            if not args.no_display:
+                # Draw detection overlay
+                detector.draw_overlay(frame, result)
+                
+                # Draw crosshair
+                draw_crosshair(frame, center_x, center_y, laser.get_threshold_px())
+                
+                # Draw stats
+                stats = perf.get_stats()
+                servo_angles = servo.get_current_angles()
+                draw_stats_overlay(frame, stats, servo_angles)
+                
+                # Show frame
+                cv2.imshow(window_name, frame)
+                
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("\nQuitting...")
+                    break
+            
+            # === PERFORMANCE TRACKING ===
+            frame_time = (time.time() - loop_start) * 1000
+            perf.record_frame(frame_time)
+            
+            # Print benchmark stats
+            if args.benchmark and int(time.time() * 10) % 10 == 0:  # Every 1 second
+                stats = perf.get_stats()
+                print(f"FPS: {stats['fps']:.1f} | "
+                      f"Avg: {stats['avg_time']:.1f}ms | "
+                      f"Min: {stats['min_time']:.1f}ms | "
+                      f"Max: {stats['max_time']:.1f}ms")
+    
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user.")
+    
+    finally:
+        # === CLEANUP ===
+        print("\nCleaning up resources...")
+        
+        # Turn off laser
+        print("Turning laser off...")
+        ws.send(laser.force_off())
+        
+        # Close connections
+        ws.close()
+        cap.release()
+        
+        if not args.no_display:
+            cv2.destroyAllWindows()
+        
+        # Cleanup detector
+        detector.cleanup()
+        
+        time.sleep(0.5)
+        print("Exiting.\n")
 
-ws.close()
-cap.release()
-cv2.destroyAllWindows()
-hands.close()
-time.sleep(0.5) 
-print("Exiting.")
+
+if __name__ == "__main__":
+    main()
