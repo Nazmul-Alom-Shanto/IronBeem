@@ -1,8 +1,8 @@
 """Configuration constants for IronBeem tracking system."""
 
 # === NETWORK CONFIGURATION ===
-EYE_STREAM_URL = "http://10.42.0.176/stream"
-HANDS_WS_URL = "ws://10.42.0.164:81"
+EYE_STREAM_URL = "http://192.168.137.114/stream"
+HANDS_WS_URL = "ws://192.168.137.120:81"
 
 # === SERVO CONFIGURATION ===
 PAN_GAIN = 0.02
